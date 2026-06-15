@@ -3,7 +3,8 @@ asyncpg
 fastapi
 langchain-core
 langgraph
-mcp[cli]
+llama-index
+llama-index-vector-stores-postgres
 psycopg2-binary
 pydantic
 python-dotenv
