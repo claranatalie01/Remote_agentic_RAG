@@ -90,15 +90,16 @@ builder.add_conditional_edges("intent_router", after_intent, {
     "direct_path": "generate_answer"
 })
 
-# RAG pipeline: retrieval → rerank → grade
+# RAG pipeline: retrieval → rerank → (skip grading) → generate_answer
 builder.add_edge("rag_pipeline", "rerank")
-builder.add_edge("rerank", "grade_docs")
+# builder.add_edge("rerank", "grade_docs")
+builder.add_edge("rerank", "generate_answer")   # <-- new
 
-builder.add_conditional_edges("grade_docs", route_after_grade, {
-    "generate_answer": "generate_answer",
-    "rewrite_query": "rewrite_query",
-    "fallback_generate": "generate_answer"
-})
+# builder.add_conditional_edges("grade_docs", route_after_grade, {
+#     "generate_answer": "generate_answer",
+#     "rewrite_query": "rewrite_query",
+#     "fallback_generate": "generate_answer"
+# })
 builder.add_edge("rewrite_query", "rag_pipeline")
 
 # Tools and final answer

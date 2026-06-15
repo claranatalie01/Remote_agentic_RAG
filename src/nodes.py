@@ -3,26 +3,20 @@ import logging
 import json
 import asyncio
 import urllib.parse
-import torch
-import torch.nn.functional as F
 import re
 from typing import Optional, Dict, Any
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from langchain_core.messages import AIMessage, HumanMessage
-from langchain_ollama import ChatOllama
-from langchain_core.embeddings import Embeddings
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-from sentence_transformers import SentenceTransformer
 from sqlalchemy import create_engine, text
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from dotenv import load_dotenv
 from gliner2 import GLiNER2
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 from .state import LibraryBotState
 from .utils import get_current_datetime
+import aiohttp
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -53,32 +47,14 @@ KEYWORD_TO_TOOL = {
 }
 
 # ----------------------------------------------------------------------
-# Database and embeddings (Qwen3-Embedding-0.6B)
+# Database
 # ----------------------------------------------------------------------
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 if not DB_PASSWORD:
     raise ValueError("DB_PASSWORD not set in .env")
 encoded_password = urllib.parse.quote(DB_PASSWORD, safe='')
-CONNECTION_STRING = f"postgresql+psycopg2://postgres:{encoded_password}@localhost:5433/hkpl_vector_db"
+CONNECTION_STRING = f"postgresql+psycopg2://postgres:{encoded_password}@postgres:5432/hkpl_vector_db"
 engine = create_engine(CONNECTION_STRING, pool_size=10, max_overflow=20)
-
-# Load Qwen3-Embedding-0.6B
-embed_model = SentenceTransformer("Qwen/Qwen3-Embedding-0.6B")
-embed_model.to("cpu")   # or "cuda"
-
-class Qwen3Embeddings(Embeddings):
-    def __init__(self, model):
-        self.model = model
-
-    def embed_documents(self, texts):
-        # For indexing documents (we use this during ingestion)
-        return self.model.encode(texts, prompt_name="document", normalize_embeddings=True).tolist()
-
-    def embed_query(self, text):
-        # For queries at retrieval time
-        return self.model.encode(text, prompt_name="query", normalize_embeddings=True).tolist()
-
-embeddings = Qwen3Embeddings(embed_model)
 
 executor = ThreadPoolExecutor(max_workers=10)
 
@@ -91,37 +67,58 @@ async def run_db_query(query_text: str, params: dict):
         )
     return result
 
+# ----------------------------------------------------------------------
+# HTTP endpoints for external services (set via environment variables)
+# ----------------------------------------------------------------------
+EMBEDDING_URL = os.getenv("EMBEDDING_URL", "http://embedding:8080/v1/embeddings")
+RERANKER_URL = os.getenv("RERANKER_URL", "http://reranker:8080/reranking")  # ✅ correct
+LLM_URL = os.getenv("LLM_URL", "http://llm:8080/v1/chat/completions")
+
+async def http_embed(texts: list[str]) -> list[list[float]]:
+    async with aiohttp.ClientSession() as session:
+        payload = {"input": texts, "model": "Qwen/Qwen3-Embedding-0.6B-GGUF:Q8_0"}
+        async with session.post(EMBEDDING_URL, json=payload) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                raise Exception(f"Embedding service error {resp.status}: {text}")
+            data = await resp.json()
+            return [item["embedding"] for item in data["data"]]   # <-- must use data["data"]
+
+async def http_rerank(query: str, documents: list[str]) -> list[float]:
+    async with aiohttp.ClientSession() as session:
+        payload = {"query": query, "documents": documents}
+        async with session.post(RERANKER_URL, json=payload) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                raise Exception(f"Reranker service error {resp.status}: {text}")
+            data = await resp.json()   # <-- no extra spaces before this line
+            scores = [0.0] * len(documents)
+            for item in data["results"]:
+                scores[item["index"]] = item["relevance_score"]
+            return scores
+
+async def http_llm(prompt: str, temperature: float = 0.0, max_tokens: int = 2048) -> str:
+    headers = {"Content-Type": "application/json"}
+    payload = {
+        "model": "qwen3.5-9b",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": False
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post(LLM_URL, json=payload, headers=headers) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                raise Exception(f"LLM service error {resp.status}: {text}")
+            data = await resp.json()
+            response = data["choices"][0]["message"]["content"]
+            if not response or len(response.strip()) == 0:
+                response = "I'm sorry, I couldn't generate a proper answer. Please try again."
+            return response
 
 # ----------------------------------------------------------------------
-# Local LLMs (glm)
-# ----------------------------------------------------------------------
-llm_deterministic = ChatOllama(
-    model="glm-4.7-flash",
-    temperature=0,
-    num_predict=2048,
-    top_p=0.95
-)
-
-llm_chat = ChatOllama(
-    model="glm-4.7-flash",
-    temperature=0.7,
-    num_predict=2048,
-    top_p=0.95
-)
-
-# ----------------------------------------------------------------------
-# Reranker (transformers‑based)
-# ----------------------------------------------------------------------
-torch.set_num_threads(2)           # Reduce CPU contention
-torch.backends.mps.is_available = lambda: False   # Disable MPS detection
-torch.backends.mps.is_built = lambda: False
-reranker_tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-Reranker-0.6B", trust_remote_code=True)
-reranker_model = AutoModelForSequenceClassification.from_pretrained("Qwen/Qwen3-Reranker-0.6B")
-reranker_model.eval()
-reranker_device = torch.device("cpu")
-reranker_model.to(reranker_device)
-# ----------------------------------------------------------------------
-# Nodes
+# Nodes (original, unchanged except replaced with HTTP)
 # ----------------------------------------------------------------------
 async def voice_to_text_node(state: LibraryBotState) -> dict:
     logger.info("[Node] Voice-to-Text Conversion (mock)")
@@ -129,7 +126,7 @@ async def voice_to_text_node(state: LibraryBotState) -> dict:
     return {"messages": [HumanMessage(content=transcribed)]}
 
 # ----------------------------------------------------------------------
-# GLiGuard safety classifier
+# GLiGuard safety classifier (unchanged)
 # ----------------------------------------------------------------------
 safety_model = None
 
@@ -282,67 +279,46 @@ async def intent_router_node(state: LibraryBotState) -> dict:
         return {"request_type": "rag_search"}
 
 # ----------------------------------------------------------------------
-# RAG pipeline (retrieve top‑3 raw chunks)
+# RAG pipeline (retrieve top‑5 raw chunks)
 # ----------------------------------------------------------------------
 async def rag_pipeline_node(state: LibraryBotState) -> dict:
     logger.info("[Node] RAG Pipeline")
     query = state["messages"][-1].content
-    loop = asyncio.get_running_loop()
-    query_vector = await loop.run_in_executor(executor, embeddings.embed_query, query)
+    embedding_list = await http_embed([query])
+    query_vector = embedding_list[0]
     query_vector_str = "[" + ",".join(str(x) for x in query_vector) + "]"
     rows = await run_db_query(
-        "SELECT text FROM document_chunks ORDER BY embedding <=> CAST(:embedding AS vector) LIMIT 3",
+        "SELECT text FROM document_chunks ORDER BY embedding <=> CAST(:embedding AS vector) LIMIT 5",
         {"embedding": query_vector_str}
     )
     chunk_texts = [row[0] for row in rows]
     context = "\n\n".join(chunk_texts) if chunk_texts else "No relevant documents found."
     logger.info(f"RAG retrieved {len(chunk_texts)} chunks")
+    logger.info(f"Retrieved chunks: {chunk_texts}")
     return {
         "retrieved_chunks": chunk_texts,
         "retrieved_context": context
     }
 
 # ----------------------------------------------------------------------
-# Reranker (Qwen3-Reranker-0.6B)
+# Reranker via HTTP
 # ----------------------------------------------------------------------
 async def rerank_node(state: LibraryBotState) -> dict:
-    logger.info("[Node] Reranking retrieved chunks")
+    logger.info("[Node] Reranking retrieved chunks via HTTP")
     query = state["messages"][-1].content
     chunks = state.get("retrieved_chunks", [])
     if not chunks:
         return {"retrieved_context": state.get("retrieved_context", ""), "is_relevant": False}
-    
-    # Truncate to at most 5 chunks for reranking (reduce memory)
     chunks = chunks[:5]
-    
-    # Prepare all pairs
-    pairs = [[query, chunk] for chunk in chunks]
-    
-    # Tokenize all at once (batch)
-    inputs = reranker_tokenizer(
-        [p[0] for p in pairs],
-        [p[1] for p in pairs],
-        return_tensors="pt",
-        truncation=True,
-        max_length=512,
-        padding=True
-    )
-    inputs = {k: v.to("cpu") for k, v in inputs.items()}
-    
-    with torch.no_grad():
-        outputs = reranker_model(**inputs)
-        logits = outputs.logits  # (batch, 2)
-        probs = torch.softmax(logits, dim=1)
-        scores = probs[:, 1].cpu().tolist()
-    
-    # Sort by relevance and take top 3
-    sorted_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
-    top_chunks = [chunks[i] for i in sorted_indices[:3]]
-    context = "\n\n".join(top_chunks)
-    return {"retrieved_context": context, "is_relevant": len(top_chunks) > 0}
+    scores = await http_rerank(query, chunks)
+    scored = list(zip(scores, chunks))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    top_chunks = [chunk for _, chunk in scored[:3]]
+    context_with_sources = "\n\n".join([f"[Source {i+1}] {chunk}" for i, chunk in enumerate(top_chunks)])
+    return {"retrieved_context": context_with_sources, "is_relevant": len(top_chunks) > 0}
 
 # ----------------------------------------------------------------------
-# Grade and rewrite (deterministic LLM)
+# Grade and rewrite (using HTTP LLM)
 # ----------------------------------------------------------------------
 async def grade_docs_node(state: LibraryBotState) -> dict:
     logger.info("[Node] Grade Documents")
@@ -350,15 +326,12 @@ async def grade_docs_node(state: LibraryBotState) -> dict:
     question = state["messages"][-1].content
     if not context or context == "No relevant documents found.":
         return {"is_relevant": False}
-    prompt = ChatPromptTemplate.from_template("""
-    Determine if the provided context contains any useful information that could help answer the user's question, even if not complete. Answer "YES" or "NO".
+    prompt = f"""Determine if the provided context contains any useful information that could help answer the user's question, even if not complete. Answer "YES" or "NO".
 
-    Context: {context}
-    Question: {question}
-    """)
-    chain = prompt | llm_deterministic | StrOutputParser()
+Context: {context}
+Question: {question}"""
     try:
-        result = await chain.ainvoke({"context": context, "question": question})
+        result = await http_llm(prompt, temperature=0.0)
         is_relevant = result.strip().upper() == "YES"
     except Exception as e:
         logger.error(f"Grade error: {e}")
@@ -369,15 +342,12 @@ async def rewrite_query_node(state: LibraryBotState) -> dict:
     logger.info("[Node] Rewrite Query")
     original = state["messages"][-1].content
     rewrite_count = state.get("rewrite_count", 0) + 1
-    prompt = ChatPromptTemplate.from_template("""
-    Rewrite the following user question to be more specific, detailed, and effective for a vector similarity search in a library knowledge base.
-    Keep the original intent but improve clarity and keywords.
+    prompt = f"""Rewrite the following user question to be more specific, detailed, and effective for a vector similarity search in a library knowledge base.
+Keep the original intent but improve clarity and keywords.
 
-    Original: {original}
-    Rewritten:
-    """)
-    chain = prompt | llm_deterministic | StrOutputParser()
-    rewritten = await chain.ainvoke({"original": original})
+Original: {original}
+Rewritten:"""
+    rewritten = await http_llm(prompt, temperature=0.0)
     new_messages = state["messages"][:-1] + [HumanMessage(content=rewritten)]
     return {"messages": new_messages, "rewrite_count": rewrite_count}
 
@@ -413,24 +383,28 @@ async def utility_api_node(state: LibraryBotState) -> dict:
         return {"retrieved_context": "Network error. Please try again later."}
 
 # ----------------------------------------------------------------------
-# Generate answer (deterministic LLM with system prompt)
+# Generate answer (using HTTP LLM)
 # ----------------------------------------------------------------------
 async def generate_answer_node(state: LibraryBotState) -> dict:
     logger.info("[Node] Generate Answer")
     request_type = state.get("request_type", "normal_info")
     question = state["messages"][-1].content
 
+    # --- Normal chat (no RAG) ---
     if request_type == "normal_info":
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", "You are a helpful library assistant. Keep answers short and friendly. Do not answer library‑specific factual questions (like hours or policies) – just chat."),
-            ("human", "{input}")
-        ])
-        chain = prompt | llm_chat
-        response = await chain.ainvoke({"input": question})
-        return {"messages": [AIMessage(content=response.content)]}
+        system_msg = "You are a helpful library assistant. Keep answers short and friendly. Do not answer library‑specific factual questions – just chat."
+        full_prompt = f"{system_msg}\n\nUser: {question}"
+        response = await http_llm(full_prompt, temperature=0.7)
+        return {"messages": [AIMessage(content=response)]}
 
-    # RAG or tool answer: deterministic LLM with context
+    # --- RAG path ---
     context = state.get("retrieved_context", "")
+    # If no context or empty, return fallback immediately
+    if not context or context == "No relevant documents found.":
+        fallback = "I'm sorry, I couldn't find that information. Could you rephrase or ask about a specific library branch (e.g., Shatin Library)?"
+        return {"messages": [AIMessage(content=fallback)]}
+
+    # Build hints (location, date, memory)
     library_name = state.get("current_library_name")
     library_code = state.get("current_library_code")
     current_time = state.get("current_datetime") or get_current_datetime()
@@ -446,29 +420,30 @@ async def generate_answer_node(state: LibraryBotState) -> dict:
     if user_memory:
         memory_hint = f"User context: {json.dumps(user_memory, indent=2)}\n"
 
+    # System prompt with clear instructions
     system_prompt = f"""You are the official HKPL (Hong Kong Public Libraries) assistant.  
-{date_hint}{location_hint}{memory_hint}Your answers must be based **only** on the provided context. Do not use any external or prior knowledge.
 
-**Guidelines:**
-1. If the context contains the exact answer, state it clearly and concisely.
-2. If the context has **partial** information, provide what is available and politely note what is missing (e.g., "The context does not specify …").
-3. If the context is completely empty or irrelevant, say:  
-   *"I'm sorry, I couldn't find that information in the library's knowledge base. Please check the HKPL website or ask a librarian."*
-4. Never invent facts, hours, floor numbers, policies, or any details not explicitly stated in the context.
-5. Keep answers short (1-3 sentences). Avoid repeating long chunks verbatim.
+{date_hint}{location_hint}{memory_hint}
 
-Context: {context}"""
+**Instructions:**
+- Answer based **only** on the provided context. Do not invent facts.
+- If the context contains the exact answer, state it clearly first, then add any relevant details.
+- If the context has **partial** information, provide what is available and clearly state what is missing.
+- If the context is completely empty or irrelevant, say: "I'm sorry, I couldn't find that information. Could you rephrase or ask about a specific library branch (e.g., Shatin Library)?"
+- Keep answers concise (1-3 sentences), but include the most important facts.
+- If the user asks for a list (e.g., multiple libraries), present it as a bullet list.
 
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", system_prompt),
-        ("human", "{question}")
-    ])
-    chain = prompt | llm_deterministic
-    response = await chain.ainvoke({"question": question})
-    return {"messages": [AIMessage(content=response.content)]}
+**Context:**
+{context}
+
+**Question:** {question}
+**Answer:**"""
+
+    response = await http_llm(system_prompt, temperature=0.0)
+    return {"messages": [AIMessage(content=response)]}
 
 # ----------------------------------------------------------------------
-# Output safety filter & MCP tool node
+# Output safety filter & MCP tool node (unchanged)
 # ----------------------------------------------------------------------
 async def output_safety_filter_node(state: LibraryBotState) -> dict:
     logger.info("[Node] Output Safety Filter")

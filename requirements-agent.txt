@@ -1,0 +1,12 @@
+aiohttp
+asyncpg
+fastapi
+langchain-core
+langgraph
+mcp[cli]
+psycopg2-binary
+pydantic
+python-dotenv
+sqlalchemy
+uvicorn
+gliner2

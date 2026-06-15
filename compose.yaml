@@ -1,0 +1,109 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: hkpl_postgres
+    environment:
+      DB_PASSWORD: ${DB_PASSWORD:-postgres}               
+      POSTGRES_DB: hkpl_vector_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres-init:/docker-entrypoint-initdb.d  
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      retries: 5
+    restart: unless-stopped
+# ---------- New: embedding service using llama.cpp ----------
+  embedding:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    container_name: hkpl_embedding
+    ports:
+      - "8003:8080"                    # different port for embedding API
+    volumes:
+      - llama_cache:/root/.cache/llama.cpp
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=0       # GPU 0 for embedding
+    command: >
+      -hf Qwen/Qwen3-Embedding-0.6B-GGUF:Q8_0
+      --host 0.0.0.0
+      --port 8080
+      --embedding                      
+      --n-gpu-layers 99
+    restart: unless-stopped
+
+  # ---------- Reranker service (Python / CrossEncoder) ----------
+  reranker:                           # ✅ properly indented
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    container_name: hkpl_reranker_cpp
+    ports:
+      - "8004:8080"
+    volumes:
+      - llama_cache:/root/.cache/llama.cpp
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=0
+    command: >
+      -hf ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:Q8_0
+      --reranking
+      --host 0.0.0.0
+      --port 8080
+      --n-gpu-layers 99
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    restart: unless-stopped
+
+
+  # ---------- LLM service (unchanged) ----------
+  llm:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    container_name: hkpl_llm
+    ports:
+      - "8081:8080"
+    volumes:
+      - llama_cache:/root/.cache/llama.cpp
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=1
+    command: >
+      -hf unsloth/Qwen3.5-9B-MTP-GGUF:Q6_K
+      --host 0.0.0.0
+      --port 8080
+      --n-gpu-layers 99
+      --ctx-size 4096
+    restart: unless-stopped
+
+  # ---------- Agent (environment variables updated) ----------
+  langgraph-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    container_name: hkpl_agent
+    ports:
+      - "8001:8001"
+    environment:
+      DB_URL: postgresql://postgres:${DB_PASSWORD:-postgres}@postgres:5432/hkpl_vector_db
+      DB_PASSWORD: ${DB_PASSWORD:-postgres}
+      EMBEDDING_URL: http://embedding:8080/v1/embeddings
+      RERANKER_URL: http://reranker:8080/reranking   # ✅ correct
+      LLM_URL: http://llm:8080/v1/chat/completions
+    depends_on:
+      postgres: { condition: service_healthy }
+      embedding: { condition: service_started }
+      reranker: { condition: service_started }
+      llm: { condition: service_started }
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  hf_cache:
+  llama_cache:
