@@ -1,15 +1,17 @@
 import os
 import asyncio
+import json
+import logging
 from typing import List
 import aiohttp
 from dotenv import load_dotenv
 from pydantic import Field
+from sqlalchemy import create_engine, text
 
 from llama_index.core import VectorStoreIndex, Settings
 from llama_index.core.base.embeddings.base import BaseEmbedding
-from llama_index.core.schema import NodeWithScore, QueryBundle
+from llama_index.core.schema import NodeWithScore, QueryBundle, TextNode
 from llama_index.core.postprocessor.types import BaseNodePostprocessor
-from llama_index.vector_stores.postgres import PGVectorStore
 
 load_dotenv()
 
@@ -65,37 +67,41 @@ class HTTPReranker(BaseNodePostprocessor):
         return nodes[:self.top_n]
 
 # ----------------------------------------------------------------------
-# Connect to pgvector – only accepted parameters
+# Load data from PostgreSQL directly into an in‑memory index
 # ----------------------------------------------------------------------
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 if not DB_PASSWORD:
     raise ValueError("DB_PASSWORD not set in .env")
 
-vector_store = PGVectorStore.from_params(
-    database="hkpl_vector_db",
-    user="postgres",
-    password=DB_PASSWORD,
-    host="postgres",
-    port=5432,
-    table_name="document_chunks",
-    embed_dim=1024,
-    # Do NOT add text_column, embedding_column, metadata_column, or schema_name – not accepted
-)
+# Database connection
+db_url = f"postgresql://postgres:{DB_PASSWORD}@postgres:5432/hkpl_vector_db"
+engine = create_engine(db_url)
+# Fetch all rows
+with engine.connect() as conn:
+    rows = conn.execute(text("SELECT text, embedding FROM document_chunks")).fetchall()
 
+# Build nodes with existing embeddings
+nodes = []
+for text, embedding in rows:
+    # Convert the string representation of the list back to a Python list
+    if isinstance(embedding, str):
+        embedding_list = json.loads(embedding)
+    else:
+        embedding_list = embedding  # In case it's already a list
+    node = TextNode(text=text, embedding=embedding_list)
+    nodes.append(node)
+
+logger = logging.getLogger(__name__)
+logger.info("🔍 LOADED_INDEX: {} nodes".format(len(nodes)))
 # ----------------------------------------------------------------------
-# Embedding model
+# Embedding model (for query embedding)
 # ----------------------------------------------------------------------
 embedding_url = os.getenv("EMBEDDING_URL", "http://embedding:8080/v1/embeddings")
 embed_model = LlamaCppEmbedding(embedding_url=embedding_url)
 Settings.embed_model = embed_model
 
-# ----------------------------------------------------------------------
-# Build index – this reads all existing rows from the table
-# ----------------------------------------------------------------------
-index = VectorStoreIndex.from_vector_store(vector_store, embed_model=embed_model)
-
-# Debug: print number of documents in the index
-print(f"✅ Index loaded with {len(index.docstore.docs)} documents.")
+# Create an in‑memory index (no PGVectorStore needed)
+index = VectorStoreIndex(nodes, embed_model=embed_model)
 
 # ----------------------------------------------------------------------
 # Create reranker and retriever

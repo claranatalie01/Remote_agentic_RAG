@@ -12,6 +12,7 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./postgres-init:/docker-entrypoint-initdb.d  
+      
 
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
@@ -64,6 +65,7 @@ services:
 
 
   # ---------- LLM service (unchanged) ----------
+  # ---------- LLM service (with reasoning disabled) ----------
   llm:
     image: ghcr.io/ggml-org/llama.cpp:server-cuda
     container_name: hkpl_llm
@@ -75,12 +77,21 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=1
     command: >
-      -hf unsloth/Qwen3.5-9B-MTP-GGUF:Q6_K
+      -hf unsloth/Qwen3.5-9B-GGUF:Q6_K
       --host 0.0.0.0
       --port 8080
       --n-gpu-layers 99
       --ctx-size 4096
+      --reasoning off
+    # 👇 ADD THIS HEALTHCHECK SO THE AGENT DOES NOT CRASH ON STARTUP
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     restart: unless-stopped
+  
 
   # ---------- Agent (environment variables updated) ----------
   langgraph-agent:
@@ -101,9 +112,9 @@ services:
       LLM_URL: http://llm:8080/v1/chat/completions
     depends_on:
       postgres: { condition: service_healthy }
-      embedding: { condition: service_started }
-      reranker: { condition: service_started }
-      llm: { condition: service_started }
+      embedding: { condition: service_healthy }
+      reranker: { condition: service_healthy }
+      llm: { condition: service_healthy }   # ← change this line
     restart: unless-stopped
 
 volumes:

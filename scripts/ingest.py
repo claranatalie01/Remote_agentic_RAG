@@ -11,7 +11,7 @@ from sqlalchemy import create_engine, text
 
 load_dotenv()
 
-DATA_PATH = os.getenv("DATA_PATH", "/home/cnatalie/agentic-rag/data/test_dataset.csv")
+DATA_PATH = os.getenv("DATA_PATH", "/home/cnatalie/agentic-RAG/data/hkpl_faq_clean.csv")
 
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 if not DB_PASSWORD:

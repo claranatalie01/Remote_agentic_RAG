@@ -26,7 +26,7 @@ def get_current_datetime():
 # ----------------------------------------------------------------------
 LLM_URL = os.getenv("LLM_URL", "http://llm:8080/v1/chat/completions")
 
-async def http_llm(prompt: str, temperature: float = 0.0, max_tokens: int = 2048) -> str:
+async def http_llm(prompt: str, temperature: float = 0.0, max_tokens: int = 4096) -> str:
     headers = {"Content-Type": "application/json"}
     payload = {
         "model": "qwen3.5-9b",
@@ -41,6 +41,7 @@ async def http_llm(prompt: str, temperature: float = 0.0, max_tokens: int = 2048
                 text = await resp.text()
                 raise Exception(f"LLM service error {resp.status}: {text}")
             data = await resp.json()
+            logger.debug(f"LLM raw response: {data}")
             response = data["choices"][0]["message"]["content"]
             if not response or len(response.strip()) == 0:
                 response = "I'm sorry, I couldn't generate a proper answer. Please try again."
@@ -222,8 +223,18 @@ async def generate_answer_node(state: LibraryBotState) -> dict:
         return {"messages": [AIMessage(content=response)]}
 
     context = state.get("retrieved_context", "")
+    # Truncate context to avoid potential token overflow
+    MAX_CONTEXT_CHARS = 300  # start conservative
+    if len(context) > MAX_CONTEXT_CHARS:
+        context = context[:MAX_CONTEXT_CHARS] + "..."
     if not context or context == "No relevant documents found.":
         fallback = "I'm sorry, I couldn't find that information. Could you rephrase or ask about a specific library branch (e.g., Shatin Library)?"
+        return {"messages": [AIMessage(content=fallback)]}
+
+    scores = state.get("retrieved_scores", [])
+    
+    if not scores or max(scores) < 0.50:  # adjust threshold as needed
+        fallback = "I don't have enough confidence to answer that. Could you rephrase your question or ask about a specific library service?"
         return {"messages": [AIMessage(content=fallback)]}
 
     library_name = state.get("current_library_name")
@@ -237,14 +248,24 @@ async def generate_answer_node(state: LibraryBotState) -> dict:
 
     # ✅ Build the system prompt first
     system_prompt = f"""You are the official HKPL (Hong Kong Public Libraries) assistant.  
-{date_hint}{location_hint}{memory_hint}
-Answer based **only** on the provided context. Keep answers concise (1-3 sentences).
+    **IMPORTANT:** Do NOT include any reasoning, thinking, or analysis in your response. Output only the final answer.
+    {date_hint}{location_hint}{memory_hint}
 
-**Context:**
-{context}
+    **Instructions:**
+    1. Answer based **only** on the provided context. Do not invent facts.
+    2. **Generalise across phrasing:** The user's question may use different words, but if the intent matches information in the context, answer it. Treat paraphrases as equivalent to the original question in the context.
+    3. **Extract fully:** If the context contains the exact answer, state it clearly and completely.
+    4. **Handle partial information:** If the context provides only part of the answer, give what is available and politely note what is missing.
+    5. **Handle empty or irrelevant context:** If the context is empty or does not address the question at all, say: "I don't have that information in my knowledge base. Please try rephrasing or ask about a specific library service."
+    6. **Be concise:** Keep answers short (1-3 sentences), but include all essential facts.
+    7. **Lists:** If the question asks for a list, present it in bullet points.
 
-**Question:** {question}
-**Answer:**"""
+    **Context:**
+    {context}
+
+    **Question:** {question}
+    **Answer:**"""
+
 
     logger.debug(f"Context length: {len(context)} characters")
     logger.debug(f"System prompt (first 500 chars): {system_prompt[:500]}...")

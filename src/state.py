@@ -8,6 +8,7 @@ class LibraryBotState(TypedDict):
     request_type: Literal["sensitive_reject", "normal_info", "tool_use", "rag_search", "mcp_tool"]
     retrieved_context: str
     retrieved_chunks: List[str]           # raw chunk texts before reranking
+    retrieved_scores: List[float]          # <-- ADD THIS LINE
     is_relevant: bool
     rewrite_count: int
     is_output_safe: bool
