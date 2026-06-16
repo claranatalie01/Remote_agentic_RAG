@@ -8,6 +8,7 @@ from llama_index.core import VectorStoreIndex, Settings
 from llama_index.core.base.embeddings.base import BaseEmbedding
 from llama_index.core.schema import NodeWithScore, QueryBundle
 from llama_index.core.postprocessor.types import BaseNodePostprocessor
+# ✅ Correct import: from postgres, not pgvector
 from llama_index.vector_stores.postgres import PGVectorStore
 
 load_dotenv()
@@ -16,7 +17,11 @@ load_dotenv()
 # Custom embedding using your llama.cpp embedding container
 # ----------------------------------------------------------------------
 class LlamaCppEmbedding(BaseEmbedding):
+    # ✅ Declare the field as a class attribute (Pydantic will recognise it)
+    embedding_url: str
+
     def __init__(self, embedding_url: str, **kwargs):
+        # ✅ Call super() first to initialise Pydantic
         super().__init__(**kwargs)
         self.embedding_url = embedding_url
 
@@ -45,6 +50,7 @@ class HTTPReranker(BaseNodePostprocessor):
     def __init__(self, reranker_url: str, top_n: int = 3):
         self.reranker_url = reranker_url
         self.top_n = top_n
+        super().__init__()
 
     async def _apostprocess(self, nodes: List[NodeWithScore], query_bundle: QueryBundle) -> List[NodeWithScore]:
         if not nodes:

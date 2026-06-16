@@ -90,6 +90,9 @@ services:
     container_name: hkpl_agent
     ports:
       - "8001:8001"
+    volumes:
+    - ./src:/app/src          # mount src folder
+    - ./main.py:/app/main.py  # mount main.py
     environment:
       DB_URL: postgresql://postgres:${DB_PASSWORD:-postgres}@postgres:5432/hkpl_vector_db
       DB_PASSWORD: ${DB_PASSWORD:-postgres}
