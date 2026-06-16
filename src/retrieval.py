@@ -8,22 +8,23 @@ from llama_index.core import VectorStoreIndex, Settings
 from llama_index.core.base.embeddings.base import BaseEmbedding
 from llama_index.core.schema import NodeWithScore, QueryBundle
 from llama_index.core.postprocessor.types import BaseNodePostprocessor
-# ✅ Correct import: from postgres, not pgvector
 from llama_index.vector_stores.postgres import PGVectorStore
+from pydantic import Field
 
 load_dotenv()
 
 # ----------------------------------------------------------------------
 # Custom embedding using your llama.cpp embedding container
 # ----------------------------------------------------------------------
+
 class LlamaCppEmbedding(BaseEmbedding):
-    # ✅ Declare the field as a class attribute (Pydantic will recognise it)
-    embedding_url: str
+    # Declare the field (you can add a description if you like)
+    embedding_url: str = Field(description="URL of the llama.cpp embedding service")
 
     def __init__(self, embedding_url: str, **kwargs):
-        # ✅ Call super() first to initialise Pydantic
-        super().__init__(**kwargs)
-        self.embedding_url = embedding_url
+        # Pass embedding_url to the parent class
+        super().__init__(embedding_url=embedding_url, **kwargs)
+        # No need to set self.embedding_url here – the parent class already stored it.
 
     async def _aget_query_embedding(self, query: str) -> List[float]:
         return await self._get_embedding(query)
@@ -52,7 +53,8 @@ class HTTPReranker(BaseNodePostprocessor):
         self.top_n = top_n
         super().__init__()
 
-    async def _apostprocess(self, nodes: List[NodeWithScore], query_bundle: QueryBundle) -> List[NodeWithScore]:
+    async def _postprocess_nodes(self, nodes: List[NodeWithScore], query_bundle: QueryBundle) -> List[NodeWithScore]:
+        # same logic as _apostprocess
         if not nodes:
             return nodes
         query = query_bundle.query_str
