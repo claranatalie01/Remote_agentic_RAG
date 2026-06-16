@@ -4,8 +4,7 @@ from pydantic import BaseModel
 from typing import Optional
 from langchain_core.messages import HumanMessage, AIMessage
 from src.graph import compiled_workflow
-from src.utils import resolve_current_library, get_current_datetime
-
+from src.nodes import get_current_datetime
 app = FastAPI(title="HKPL Agentic RAG Service")
 
 class UserRequest(BaseModel):

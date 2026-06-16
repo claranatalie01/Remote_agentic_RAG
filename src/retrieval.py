@@ -3,28 +3,27 @@ import asyncio
 from typing import List
 import aiohttp
 from dotenv import load_dotenv
+from pydantic import Field
 
 from llama_index.core import VectorStoreIndex, Settings
 from llama_index.core.base.embeddings.base import BaseEmbedding
 from llama_index.core.schema import NodeWithScore, QueryBundle
 from llama_index.core.postprocessor.types import BaseNodePostprocessor
+# ✅ correct import
 from llama_index.vector_stores.postgres import PGVectorStore
-from pydantic import Field
 
 load_dotenv()
 
 # ----------------------------------------------------------------------
 # Custom embedding using your llama.cpp embedding container
 # ----------------------------------------------------------------------
-
 class LlamaCppEmbedding(BaseEmbedding):
-    # Declare the field (you can add a description if you like)
+    # ✅ Declare the field
     embedding_url: str = Field(description="URL of the llama.cpp embedding service")
 
     def __init__(self, embedding_url: str, **kwargs):
-        # Pass embedding_url to the parent class
+        # ✅ Pass to parent
         super().__init__(embedding_url=embedding_url, **kwargs)
-        # No need to set self.embedding_url here – the parent class already stored it.
 
     async def _aget_query_embedding(self, query: str) -> List[float]:
         return await self._get_embedding(query)
@@ -48,13 +47,15 @@ class LlamaCppEmbedding(BaseEmbedding):
 # Custom reranker that calls your llama.cpp reranker container
 # ----------------------------------------------------------------------
 class HTTPReranker(BaseNodePostprocessor):
-    def __init__(self, reranker_url: str, top_n: int = 3):
-        self.reranker_url = reranker_url
-        self.top_n = top_n
-        super().__init__()
+    # ✅ Declare fields
+    reranker_url: str = Field(description="URL of the reranker service")
+    top_n: int = Field(3, description="Number of top nodes to keep after reranking")
+
+    def __init__(self, reranker_url: str, top_n: int = 3, **kwargs):
+        # ✅ Pass to parent
+        super().__init__(reranker_url=reranker_url, top_n=top_n, **kwargs)
 
     async def _postprocess_nodes(self, nodes: List[NodeWithScore], query_bundle: QueryBundle) -> List[NodeWithScore]:
-        # same logic as _apostprocess
         if not nodes:
             return nodes
         query = query_bundle.query_str
@@ -67,9 +68,6 @@ class HTTPReranker(BaseNodePostprocessor):
             node.score = score
         nodes.sort(key=lambda x: x.score, reverse=True)
         return nodes[:self.top_n]
-
-    def _postprocess(self, nodes: List[NodeWithScore], query_bundle: QueryBundle) -> List[NodeWithScore]:
-        return asyncio.run(self._apostprocess(nodes, query_bundle))
 
 # ----------------------------------------------------------------------
 # Connect to pgvector
