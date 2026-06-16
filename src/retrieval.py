@@ -8,7 +8,7 @@ from llama_index.core import VectorStoreIndex, Settings
 from llama_index.core.base.embeddings.base import BaseEmbedding
 from llama_index.core.schema import NodeWithScore, QueryBundle
 from llama_index.core.postprocessor.types import BaseNodePostprocessor
-from llama_index.vector_stores.pgvector import PGVectorStore
+from llama_index.vector_stores.postgres import PGVectorStore
 
 load_dotenv()
 
