@@ -1,15 +1,24 @@
--- Enable pgvector extension
+-- Enable pgvector extension for vector search support
 CREATE EXTENSION IF NOT EXISTS vector;
 
--- Create the document chunks table (1024 dimensions for Qwen3-Embedding-0.6B)
-CREATE TABLE IF NOT EXISTS document_chunks (
-    id SERIAL PRIMARY KEY,
-    text TEXT NOT NULL,
-    embedding VECTOR(1024),
-    metadata JSONB
+-- Store short-term conversation history for session-based memory.
+-- This table is used by src/memory.py.
+CREATE TABLE IF NOT EXISTS conversation_history (
+    id BIGSERIAL PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    content TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT NOW()
 );
 
--- Optional: add an index for faster similarity search
-CREATE INDEX IF NOT EXISTS idx_document_chunks_embedding 
-ON document_chunks USING ivfflat (embedding vector_cosine_ops)
-WITH (lists = 100);
+-- Index for quickly loading the latest turns from one session.
+CREATE INDEX IF NOT EXISTS idx_conversation_history_session_time
+ON conversation_history(session_id, created_at);
+
+-- NOTE:
+-- We no longer manually create document_chunks.
+-- LlamaIndex PGVectorStore will automatically create/manage:
+--
+--     data_hkpl_faq
+--
+-- when scripts/ingest_pgvector_llamaindex.py runs.

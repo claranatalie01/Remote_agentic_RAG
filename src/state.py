@@ -1,20 +1,48 @@
 from typing import Literal, TypedDict, List, Dict, Any, Optional
 from langchain_core.messages import BaseMessage
 
+
+class ConversationTurn(TypedDict):
+    role: str
+    content: str
+
+
 class LibraryBotState(TypedDict):
     messages: List[BaseMessage]
+
+    session_id: str
+    conversation_history: List[ConversationTurn]
+
     input_type: Literal["text", "voice"]
     stt_confidence: float
-    request_type: Literal["sensitive_reject", "normal_info", "tool_use", "rag_search", "mcp_tool"]
+
+    request_type: Literal[
+        "sensitive_reject",
+        "normal_info",
+        "tool_use",
+        "rag_search",
+        "mcp_tool"
+    ]
+
+    original_query: str
+    rewritten_query: str
+
     retrieved_context: str
-    retrieved_chunks: List[str]           # raw chunk texts before reranking
-    retrieved_scores: List[float]          # <-- ADD THIS LINE
+    retrieved_chunks: List[str]
+    retrieved_scores: List[float]
+    retrieved_sources: List[Dict[str, Any]]
+    generated_answer: str
+    faithfulness_passed: bool
+    faithfulness_reason: str
+
     is_relevant: bool
     rewrite_count: int
+
     is_output_safe: bool
     tool_name: str
     tool_args: Dict[str, Any]
     end_conversation: bool
+
     current_library_code: Optional[str]
     current_library_name: Optional[str]
     current_datetime: str

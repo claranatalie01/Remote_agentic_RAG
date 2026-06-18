@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 from gliner2 import GLiNER2
 from .state import LibraryBotState
 from .retrieval import retriever   # LlamaIndex retriever (includes reranking)
+from .memory import save_conversation_turn
 import aiohttp
 
 load_dotenv()
@@ -183,31 +184,280 @@ async def intent_router_node(state: LibraryBotState) -> dict:
 # RAG pipeline using LlamaIndex retriever (includes reranking)
 # ----------------------------------------------------------------------
 async def rag_pipeline_node(state: LibraryBotState) -> dict:
-    logger.info("[Node] RAG Pipeline (LlamaIndex + built‑in reranking)")
-    query = state["messages"][-1].content
-    logger.debug(f"Query: {query}")
+    # Log that the RAG retrieval node has started
+    logger.info("[Node] RAG Pipeline (LlamaIndex + PGVectorStore + reranking)")
 
+    # Use rewritten query if available; otherwise use the latest user message
+    query = state.get("rewritten_query") or state["messages"][-1].content
+    logger.debug(f"Retrieval query: {query}")
+
+    # Measure retrieval time for debugging and performance monitoring
     start = time.time()
+
+    # Retrieve relevant nodes using LlamaIndex retriever
     nodes = await retriever.aretrieve(query)
+
+    # Calculate retrieval duration
     elapsed = time.time() - start
     logger.info(f"Retrieval took {elapsed:.3f} seconds")
 
-    chunk_texts = [node.node.text for node in nodes]
-    scores = [node.score for node in nodes]
-    context = "\n\n".join(chunk_texts) if chunk_texts else "No relevant documents found."
+    # Store retrieved chunk texts
+    chunk_texts = []
 
-    logger.debug(f"Retrieved {len(nodes)} nodes. Scores: {scores}")
-    if nodes:
-        logger.debug(f"Top chunk text: {nodes[0].node.text[:200]}")
+    # Store similarity/reranking scores
+    scores = []
+
+    # Store metadata used later for citations/debugging
+    sources = []
+
+    # Convert LlamaIndex NodeWithScore objects into plain Python data
+    for i, node in enumerate(nodes):
+        # Metadata was saved during ingestion
+        metadata = node.node.metadata or {}
+
+        # Use 0.0 if score is missing
+        score = node.score if node.score is not None else 0.0
+
+        # Store the actual retrieved text
+        chunk_texts.append(node.node.text)
+
+        # Store the retrieval/reranking score
+        scores.append(score)
+
+        # Store source metadata for citations and traceability
+        sources.append(
+        {
+            "chunk_index": i,
+            "score": score,
+            "source": metadata.get("source", "HKPL Ask a Librarian FAQ"),
+            "source_title": metadata.get("source_title", metadata.get("source", "HKPL Ask a Librarian FAQ")),
+            "url": metadata.get("url", "https://www.hkpl.gov.hk/en/ask-a-librarian/faq.html"),
+            "source_url": metadata.get("source_url", metadata.get("url", "https://www.hkpl.gov.hk/en/ask-a-librarian/faq.html")),
+            "domain": metadata.get("domain", ""),
+            "question": metadata.get("question", ""),
+            "row_id": metadata.get("row_id", ""),
+                }
+            )
+        
+
+    # Build context string passed to the answer generation node
+    if chunk_texts:
+        context = "\n\n".join(
+            f"[Source {i + 1}]\n{text}"
+            for i, text in enumerate(chunk_texts)
+        )
     else:
-        logger.debug("No chunks retrieved.")
+        context = "No relevant documents found."
 
+    # Log retrieval details for debugging
+    logger.debug(f"Retrieved {len(nodes)} nodes. Scores: {scores}")
+
+    # Log the top retrieved chunk and source
+    if chunk_texts:
+        logger.debug(f"Top chunk text: {chunk_texts[0][:300]}")
+        logger.debug(f"Top source: {sources[0]}")
+
+    # Return retrieval results into LangGraph state
     return {
         "retrieved_chunks": chunk_texts,
         "retrieved_context": context,
         "retrieved_scores": scores,
+        "retrieved_sources": sources,
     }
 
+def format_citations(sources: list[dict]) -> str:
+    # Convert retrieved source metadata into readable citations.
+    seen = set()
+    citation_lines = []
+
+    for source in sources:
+        title = source.get("source_title") or source.get("source", "HKPL Ask a Librarian FAQ")
+        url = source.get("source_url") or source.get("url", "https://www.hkpl.gov.hk/en/ask-a-librarian/faq.html")
+        domain = source.get("domain", "")
+        question = source.get("question", "")
+
+        key = (title, url, question)
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+
+        line = f"- {title}"
+
+        if domain:
+            line += f" – {domain}"
+
+        if question:
+            line += f": {question}"
+
+        if url:
+            line += f"\n  {url}"
+
+        citation_lines.append(line)
+
+    if not citation_lines:
+        return ""
+
+    return "\n\nSources:\n" + "\n".join(citation_lines[:1])  # Limit to top 1 source for brevity
+
+async def faithfulness_check_node(state: LibraryBotState) -> dict:
+    logger.info("[Node] Faithfulness Check")
+
+    answer = state.get("generated_answer") or state["messages"][-1].content
+    context = state.get("retrieved_context", "")
+
+    if not context or context == "No relevant documents found.":
+        fallback = (
+            "I don't have enough verified information in my knowledge base "
+            "to answer that reliably. Please try rephrasing or ask about a "
+            "specific HKPL service."
+        )
+
+        return {
+            "faithfulness_passed": False,
+            "faithfulness_reason": "No retrieved context available.",
+            "messages": [AIMessage(content=fallback)],
+            "generated_answer": fallback,
+        }
+
+    prompt = f"""
+You are checking whether an HKPL assistant answer is fully supported by the retrieved context.
+
+Return ONLY valid JSON.
+
+Format:
+{{"supported": true, "reason": "short reason"}}
+or
+{{"supported": false, "reason": "short reason"}}
+
+Rules:
+- Return supported=true if the answer is broadly supported by the retrieved context.
+- Do not reject because of minor wording differences.
+- Do not reject if the answer merges equivalent details from multiple retrieved sources.
+- Return supported=false only if the answer gives a clearly wrong instruction, unsupported phone number, unsupported service name, unsupported requirement, or unsupported URL.
+
+Retrieved context:
+{context}
+
+Assistant answer:
+{answer}
+
+JSON:
+"""
+
+    try:
+        raw = await http_llm(prompt, temperature=0.0, max_tokens=256)
+        raw = raw.strip()
+
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if match:
+            raw = match.group(0)
+
+        result = json.loads(raw)
+        supported = bool(result.get("supported", False))
+        reason = result.get("reason", "")
+
+    except Exception as e:
+        logger.error(f"Faithfulness check failed: {e}")
+        supported = True
+        reason = "Faithfulness checker failed; answer allowed."
+
+    logger.info(f"Faithfulness result: supported={supported}, reason={reason}")
+
+    return {
+        "faithfulness_passed": supported,
+        "faithfulness_reason": reason,
+    }
+
+    
+async def add_citations_node(state: LibraryBotState) -> dict:
+    logger.info("[Node] Add Citations")
+
+    answer = state.get("generated_answer") or state["messages"][-1].content
+    sources = state.get("retrieved_sources", [])
+
+    citations = format_citations(sources)
+    if "I don't have enough confidence" in answer:
+        return {
+            "messages": [AIMessage(content=answer)],
+            "generated_answer": answer,
+        }
+    if citations and "Sources:" not in answer:
+        answer = answer.strip() + citations
+    return {
+        "messages": [AIMessage(content=answer)],
+        "generated_answer": answer,
+    }
+async def rewrite_query_node(state: LibraryBotState) -> dict:
+    logger.info("[Node] Query Rewriter")
+
+    question = state["messages"][-1].content
+    history = state.get("conversation_history", [])
+
+    if not history:
+        return {
+            "original_query": question,
+            "rewritten_query": question,
+        }
+
+    history_text = "\n".join(
+        f"{turn['role']}: {turn['content']}"
+        for turn in history
+    )
+
+    prompt = f"""
+You rewrite follow-up library questions into standalone search queries.
+
+Rules:
+- Use the conversation history only to resolve references like "it", "that", "them", "do I need it".
+- Do not answer the question.
+- Do not add information not implied by the history.
+- Output only the rewritten query.
+
+Conversation history:
+{history_text}
+
+Current user question:
+{question}
+
+Standalone search query:
+"""
+
+    try:
+        rewritten = await http_llm(prompt, temperature=0.0, max_tokens=128)
+        rewritten = rewritten.strip()
+
+        if not rewritten:
+            rewritten = question
+
+    except Exception as e:
+        logger.error(f"Query rewrite failed: {e}")
+        rewritten = question
+
+    logger.debug(f"Original query: {question}")
+    logger.debug(f"Rewritten query: {rewritten}")
+
+    return {
+        "original_query": question,
+        "rewritten_query": rewritten,
+    }
+
+async def save_conversation_node(state: LibraryBotState) -> dict:
+    logger.info("[Node] Save Conversation History")
+
+    session_id = state.get("session_id", "")
+    user_question = state.get("original_query") or state["messages"][0].content
+    assistant_answer = state["messages"][-1].content
+
+    try:
+        save_conversation_turn(session_id, "user", user_question)
+        save_conversation_turn(session_id, "assistant", assistant_answer)
+    except Exception as e:
+        logger.error(f"Failed to save conversation history: {e}")
+
+    return {}
+    
 # ----------------------------------------------------------------------
 # Generate answer (using HTTP LLM)
 # ----------------------------------------------------------------------
@@ -220,22 +470,30 @@ async def generate_answer_node(state: LibraryBotState) -> dict:
         system_msg = "You are a helpful library assistant. Keep answers short and friendly."
         full_prompt = f"{system_msg}\n\nUser: {question}"
         response = await http_llm(full_prompt, temperature=0.7)
-        return {"messages": [AIMessage(content=response)]}
+        return {
+            "messages": [AIMessage(content=response)],
+            "generated_answer": response,
+        }
 
     context = state.get("retrieved_context", "")
     # Truncate context to avoid potential token overflow
-    MAX_CONTEXT_CHARS = 300  # start conservative
+    MAX_CONTEXT_CHARS = 4000
     if len(context) > MAX_CONTEXT_CHARS:
         context = context[:MAX_CONTEXT_CHARS] + "..."
     if not context or context == "No relevant documents found.":
         fallback = "I'm sorry, I couldn't find that information. Could you rephrase or ask about a specific library branch (e.g., Shatin Library)?"
-        return {"messages": [AIMessage(content=fallback)]}
-
+        return {
+            "messages": [AIMessage(content=fallback)],
+            "generated_answer": fallback,
+        }
     scores = state.get("retrieved_scores", [])
     
     if not scores or max(scores) < 0.50:  # adjust threshold as needed
         fallback = "I don't have enough confidence to answer that. Could you rephrase your question or ask about a specific library service?"
-        return {"messages": [AIMessage(content=fallback)]}
+        return {
+    "messages": [AIMessage(content=fallback)],
+    "generated_answer": fallback,
+}
 
     library_name = state.get("current_library_name")
     library_code = state.get("current_library_code")
@@ -259,6 +517,7 @@ async def generate_answer_node(state: LibraryBotState) -> dict:
     5. **Handle empty or irrelevant context:** If the context is empty or does not address the question at all, say: "I don't have that information in my knowledge base. Please try rephrasing or ask about a specific library service."
     6. **Be concise:** Keep answers short (1-3 sentences), but include all essential facts.
     7. **Lists:** If the question asks for a list, present it in bullet points.
+    8. **Stay specific**: Do not broaden the answer beyond the retrieved FAQ. If the context is about e-resources, answer only about e-resources. Do not add advice for unrelated issues.
 
     **Context:**
     {context}
@@ -271,7 +530,12 @@ async def generate_answer_node(state: LibraryBotState) -> dict:
     logger.debug(f"System prompt (first 500 chars): {system_prompt[:500]}...")
 
     response = await http_llm(system_prompt, temperature=0.0)
-    return {"messages": [AIMessage(content=response)]}
+
+    # Store the generated answer separately so later nodes can inspect it.
+    return {
+        "messages": [AIMessage(content=response)],
+        "generated_answer": response,
+    }
 
 # ----------------------------------------------------------------------
 # Output safety filter

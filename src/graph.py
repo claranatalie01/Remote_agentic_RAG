@@ -5,11 +5,14 @@ from .nodes import (
     voice_to_text_node,
     safety_and_intent_node,
     intent_router_node,
+    rewrite_query_node,
     rag_pipeline_node,
     generate_answer_node,
     output_safety_filter_node,
+    save_conversation_node,
+    add_citations_node,
+    faithfulness_check_node
 )
-
 # ----------------------------------------------------------------------
 # Routing logic
 # ----------------------------------------------------------------------
@@ -44,9 +47,14 @@ builder = StateGraph(LibraryBotState)
 builder.add_node("voice_to_text", voice_to_text_node)
 builder.add_node("safety", safety_and_intent_node)
 builder.add_node("intent_router", intent_router_node)
+builder.add_node("rewrite_query", rewrite_query_node)
 builder.add_node("rag_pipeline", rag_pipeline_node)
+builder.add_node("faithfulness_check", faithfulness_check_node)
+builder.add_node("add_citations", add_citations_node)
 builder.add_node("generate_answer", generate_answer_node)
 builder.add_node("output_safety_filter", output_safety_filter_node)
+builder.add_node("save_conversation", save_conversation_node)
+
 
 # Start edges
 builder.add_conditional_edges(START, route_by_input_type, {
@@ -61,20 +69,26 @@ builder.add_conditional_edges("safety", after_safety, {
     "continue": "intent_router"
 })
 
-# After intent router
 builder.add_conditional_edges("intent_router", after_intent, {
-    "rag_path": "rag_pipeline",
+    "rag_path": "rewrite_query",
     "direct_path": "generate_answer"
 })
 
+builder.add_edge("rewrite_query", "rag_pipeline")
 # RAG directly to answer (reranking already inside retriever)
+
 builder.add_edge("rag_pipeline", "generate_answer")
 
-# Output safety filter
-builder.add_edge("generate_answer", "output_safety_filter")
+
+builder.add_edge("generate_answer", "faithfulness_check")
+builder.add_edge("faithfulness_check", "add_citations")
+builder.add_edge("add_citations", "output_safety_filter")
+
 builder.add_conditional_edges("output_safety_filter", route_safety_decision, {
-    "show": END,
+    "show": "save_conversation",
     "block": END
 })
+
+builder.add_edge("save_conversation", END)
 
 compiled_workflow = builder.compile()
