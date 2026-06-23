@@ -105,25 +105,102 @@ async def safety_and_intent_node(state: LibraryBotState) -> dict:
 
     try:
         result = model.classify_text(user_input, schema, threshold=0.5)
+        logger.debug(f"GLiGuard raw result: {result}")
+
         safety = result.get("prompt_safety", "safe")
-        is_unsafe = (safety == "unsafe")
         detected_categories = []
+
         toxicity = result.get("prompt_toxicity", [])
         if isinstance(toxicity, list):
             detected_categories.extend(toxicity)
+
         jailbreak = result.get("jailbreak_detection", [])
         if isinstance(jailbreak, list):
             detected_categories.extend(jailbreak)
+
+        # Remove benign + duplicates.
+        detected_categories = sorted({
+            cat for cat in detected_categories
+            if cat and cat != "benign"
+        })
+
+        # High-risk categories: block immediately.
+        # These are categories where allowing the request could be unsafe.
+        hard_block_categories = {
+            "violence_and_weapons",
+            "sexual_content",
+            "hate_and_discrimination",
+            "self_harm_and_suicide",
+            "pii_exposure",
+            "child_safety",
+            "political_manipulation",
+            "privacy_violation",
+            "prompt_injection",
+            "jailbreak_attempt",
+            "policy_evasion",
+            "instruction_override",
+            "system_prompt_exfiltration",
+            "data_exfiltration",
+            "obfuscated_attack",
+        }
+
+        # Ambiguous categories: log for monitoring, but do not block by themselves.
+        # These caused false positives for valid HKPL questions such as:
+        # "What is Adobe Digital Editions?" and "What is it and how do I use it?"
+        soft_flag_categories = {
+            "non_violent_crime",
+            "copyright_violation",
+            "misinformation",
+            "regulated_advice",
+            "unethical_conduct",
+            "multi_step_attack",
+            "hypothetical_bypass",
+            "roleplay_bypass",
+            "social_engineing",
+            "social_engineering",
+            "other",
+        }
+
+        hard_hits = [
+            cat for cat in detected_categories
+            if cat in hard_block_categories
+        ]
+
+        soft_hits = [
+            cat for cat in detected_categories
+            if cat in soft_flag_categories
+        ]
+
+        # Final safety decision:
+        # - hard-hit categories are blocked.
+        # - soft-hit categories are only logged.
+        # - prompt_safety is kept for logging, but not trusted alone because
+        #   GLiGuard can return contradictory outputs such as unsafe + benign.
+        is_unsafe = len(hard_hits) > 0
+
+        # Keep this alias so the existing log_entry / debugging code remains clear.
+        blocking_hits = hard_hits
+
+        logger.info(
+            f"Safety={safety}; categories={detected_categories}; "
+            f"hard_hits={hard_hits}; soft_hits={soft_hits}; is_unsafe={is_unsafe}"
+        )
+
     except Exception as e:
         logger.error(f"GLiGuard classification error: {e}")
         is_unsafe = False
         detected_categories = []
-
+        hard_hits = []
+        soft_hits = []
+        blocking_hits = []
+       
     log_entry = {
         "timestamp": datetime.now().isoformat(),
         "user_input": user_input[:500],
         "safety": "unsafe" if is_unsafe else "safe",
-        "categories": detected_categories
+        "categories": detected_categories,
+        "hard_hits": hard_hits,
+        "soft_hits": soft_hits,
     }
 
     if is_unsafe:
@@ -172,14 +249,51 @@ async def safety_and_intent_node(state: LibraryBotState) -> dict:
 # Intent router (only distinguishes greetings from everything else)
 # ----------------------------------------------------------------------
 async def intent_router_node(state: LibraryBotState) -> dict:
-    logger.info("[Node] Intent Router (keyword‑based)")
-    user_input = state["messages"][-1].content.lower()
+    logger.info("[Node] Intent Router")
 
-    if any(word in user_input for word in ["hello", "hi", "hey", "greeting"]):
-        return {"request_type": "normal_info"}
+    user_query = state["messages"][-1].content.strip()
+
+    prompt = f"""
+Classify the user's message into exactly one of these labels:
+
+- greeting: greetings such as hello, hi, good morning
+- thanks: thank you messages
+- library_question: any question about HKPL services, library materials, e-resources, borrowing, collections, classification schemes, opening hours, reference services, accounts, apps, or library help
+- other: anything else that is safe but not a greeting or thanks
+
+Return only valid JSON:
+{{"intent": "greeting" | "thanks" | "library_question" | "other"}}
+
+User message:
+{user_query}
+"""
+
+    try:
+        raw = await http_llm(prompt, temperature=0.0, max_tokens=80)
+        raw = raw.strip()
+
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if match:
+            raw = match.group(0)
+
+        parsed = json.loads(raw)
+        intent = parsed.get("intent", "library_question")
+
+    except Exception as e:
+        logger.warning(f"Intent classification failed, defaulting to RAG: {e}")
+        intent = "library_question"
+
+    if intent in ["greeting", "thanks"]:
+        request_type = "normal_info"
     else:
-        return {"request_type": "rag_search"}
+        request_type = "rag_search"
 
+    logger.info(f"Intent classified as: {intent}; request_type={request_type}")
+
+    return {
+        "intent": intent,
+        "request_type": request_type,
+    }
 # ----------------------------------------------------------------------
 # RAG pipeline using LlamaIndex retriever (includes reranking)
 # ----------------------------------------------------------------------
@@ -463,7 +577,7 @@ async def save_conversation_node(state: LibraryBotState) -> dict:
 # ----------------------------------------------------------------------
 async def generate_answer_node(state: LibraryBotState) -> dict:
     logger.info("[Node] Generate Answer")
-    request_type = state.get("request_type", "normal_info")
+    request_type = state.get("request_type", "rag_search")
     question = state["messages"][-1].content
 
     if request_type == "normal_info":

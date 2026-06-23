@@ -30,10 +30,12 @@ def after_safety(state: LibraryBotState) -> Literal["end", "continue"]:
     return "continue"
 
 def after_intent(state: LibraryBotState) -> Literal["rag_path", "direct_path"]:
-    req = state.get("request_type", "normal_info")
-    if req == "rag_search":
-        return "rag_path"
-    return "direct_path"
+    req = state.get("request_type", "rag_search")
+
+    if req == "normal_info":
+        return "direct_path"
+
+    return "rag_path"
 
 def route_safety_decision(state: LibraryBotState) -> Literal["show", "block"]:
     return "show" if state.get("is_output_safe", True) else "block"
